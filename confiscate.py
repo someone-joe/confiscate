@@ -1,7 +1,9 @@
 import time
 import datetime
+import os
+import re
 
-import pymysql
+# import pymysql
 
 # 连接数据库并将值传入
 # db = pymysql.connect(host='localhost', port=3306, user='root', password='123qwe+++', db='confiscate', charset='utf8')
@@ -76,6 +78,17 @@ def new_confiscate(db_date, money, is_exec = 0):
         next_money = cur_confiscate
         next_date_up = now_date
 
+        # 构造待写入 SQL 脚本的数据行
+        record = {
+            'money_old': str(money),
+            'date_old': str(old_date),
+            'total': str(round(sum, 1)),
+            'date_added': str(now_date),
+            'next_money': str(next_money),
+            'next_date_up': str(next_date_up),
+        }
+        logger['record'] = record
+
         if is_exec in ('y', 'Y', 'yes', 'yep'):
             info = "正在存入数据库..."
             exec_y_result.append(info)
@@ -142,6 +155,6 @@ if __name__ == '__main__':
     # date, money = deal_date()
     # 根据前面的查询执行
     # result = new_confiscate(date, money, 'N')
-    result = new_confiscate("2025-03-14", 32.4)
+    result = new_confiscate("2026-07-16", 8.1)
     print(result)
     x = input("111")
