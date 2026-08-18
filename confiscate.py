@@ -1,160 +1,169 @@
-import time
-import datetime
-import os
+#!/usr/bin/env python3
+"""存钱打卡小工具
+
+规则：每天比前一天多存 0.1 元；金额累计满一年（达到 36.5 元 = 365 × 0.1）
+后，于次日从 0.1 元重新起算（跨年重置）。
+
+用法：
+    python confiscate.py                 # 取 SQL 最近一条作起点，算到今天
+    python confiscate.py 2026-08-01      # 同上，但算到指定结束日期
+    python confiscate.py 2026-07-16 8.1  # 手动指定起点（上次日期/金额）
+"""
+
+from __future__ import annotations
+
+import argparse
 import re
+from datetime import date, timedelta
 
-# import pymysql
+STEP = 0.1        # 每日递增金额
+YEAR_CAP = 36.5   # 年度上限：365 天 × 0.1 元
+SQL_FILE = "confiscate_241011.sql"
 
-# 连接数据库并将值传入
-# db = pymysql.connect(host='localhost', port=3306, user='root', password='123qwe+++', db='confiscate', charset='utf8')
-# cursor = db.cursor()
-"""
-字段分别为：   
-    id              INT UNSIGNED AUTO_INCREMENT,
-    money_old       VARCHAR(20) COMMENT '运算时输入的打卡金额',
-    date_old        varchar(15)	COMMENT '运算时输入的打卡时间',
-    total           VARCHAR(20) COMMENT '此次运算的打卡金额',
-    date_added      date	comment'此次运算的添加时间',
-    next_money      VARCHAR(20) comment '下次执行数据',
-    next_date_up    VARCHAR(20) comment '下次执行开始时间，即上一个的添加时间'
-"""
+_DATE = re.compile(r"\d{4}-\d{1,2}-\d{1,2}")
+_NUM = re.compile(r"\d+(\.\d+)?")
 
 
-def new_confiscate(db_date, money, is_exec = 0):
+def _norm_date(text: str):
+    """把 '2026-3-18' 这类未补零的日期解析为 date，失败返回 None。"""
+    try:
+        y, m, d = text.split("-")
+        return date(int(y), int(m), int(d))
+    except (ValueError, AttributeError):
+        return None
+
+
+def parse_date(text: str) -> date:
+    """解析 '2026-07-16' 或 '2026-7-16' 两种写法。"""
+    return date.fromisoformat(text)
+
+
+def build_plan(start_date: date, start_amount: float, end_date: date):
+    """生成从 start_date 的次日到 end_date 的每日应存计划。
+
+    返回 (明细[(日期, 金额)], 总额, 末日金额, 跨年重置次数)。
+    末日金额即下一次打卡的起始金额。
     """
-    输入断开签到的月日，和最近一天签到金额，算出续签的金额
-    :param data: "2022-04-11"
-    :param money: 35.4
+    details: list[tuple[date, float]] = []
+    total = 0.0
+    resets = 0
+    amount = start_amount
+    day = start_date
+    while day < end_date:
+        day += timedelta(days=1)
+        amount = round(amount + STEP, 1)
+        if amount > YEAR_CAP:          # 跨年重置
+            amount = STEP
+            resets += 1
+        total += amount
+        details.append((day, amount))
+    return details, round(total, 1), amount, resets
+
+
+def latest_record():
+    """读取 SQL 中日期最近的一条记录，返回 (last_date, last_amount) 作为默认值。
+
+    记录形如 (id, ..., total, start_date, end_amount, end_date)，
+    取其中最大的日期为上次打卡日，取最后一个数值字段为上次打卡金额。
+    文件缺失或无记录时返回 (None, None)。
     """
-    logger = {"confiscate_info": [], "is_exec": {"y": [], "n": []}, }
-    confiscate_info = logger["confiscate_info"]
-    exec_y_result = logger["is_exec"]["y"]
-    exec_n_result = logger["is_exec"]["n"]
+    try:
+        with open(SQL_FILE, encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        return None, None
 
-    ISOTIMEFORMAT = "%Y-%m-%d"
-    now = time.strftime(ISOTIMEFORMAT)
-    # now = "2022-06-10"
-    # 当前日期的月和日
-    now_date = datetime.datetime.strptime(now, ISOTIMEFORMAT).date()
+    # 按真实日期挑出“最近一条”，避免 '2026-3-18' 这类未补零字符串误判最大
+    best_obj = None
+    best_str = None
+    best_fields = None
+    for t in re.findall(r"\((\d+,\s*[^()]*)\)", text):
+        fields = [x.strip().strip("'").strip('"') for x in t.split(",")]
+        cand = None
+        for x in fields:
+            if _DATE.fullmatch(x):
+                d = _norm_date(x)
+                if d and (cand is None or d > cand[0]):
+                    cand = (d, x)
+        if cand and (best_obj is None or cand[0] > best_obj):
+            best_obj, best_str, best_fields = cand[0], cand[1], fields
+    if best_fields is None:
+        return None, None
 
-    old_date = datetime.datetime.strptime(db_date, ISOTIMEFORMAT).date()
-
-    # 间隔天数
-    interval = (now_date - old_date).days
-
-    # 这里开始计算金额
-    remain_interval = sum = confiscate_date = cur_confiscate = 0
-    if interval:
-        for i in range(1, interval + 1):
-            cur_confiscate = round(money + i * 0.1, 1)
-            # 若是满了一年，则停止累加，开始新的一轮
-            if cur_confiscate > 36.5:
-                info = "哇~又过了一年了，真棒！"
-                confiscate_info.append(info)
-                print(info)
-                remain_interval = interval - i
-                break
-            sum += cur_confiscate
-            confiscate_date = old_date + datetime.timedelta(days=i)
-            info = "{}，需支付{}元！".format(confiscate_date, cur_confiscate)
-            confiscate_info.append(info)
-            print(info)
-
-        if remain_interval:
-            for i in range(1, remain_interval + 1):
-                cur_confiscate = round(i * 0.1, 1)
-                new_confiscate_date = confiscate_date + datetime.timedelta(days=i)
-                sum += cur_confiscate
-                info = "{}，需支付{}元！".format(new_confiscate_date, cur_confiscate)
-                confiscate_info.append(info)
-                print(info)
-
-        info = "与上次提交时隔{}天，总共需支付{}元".format(interval, round(sum, 1))
-        confiscate_info.append(info)
-        print(info)
-
-        # 用于转账时的简短描述
-        description = "算了，看着有点复杂"
-        next_money = cur_confiscate
-        next_date_up = now_date
-
-        # 构造待写入 SQL 脚本的数据行
-        record = {
-            'money_old': str(money),
-            'date_old': str(old_date),
-            'total': str(round(sum, 1)),
-            'date_added': str(now_date),
-            'next_money': str(next_money),
-            'next_date_up': str(next_date_up),
-        }
-        logger['record'] = record
-
-        if is_exec in ('y', 'Y', 'yes', 'yep'):
-            info = "正在存入数据库..."
-            exec_y_result.append(info)
-            print(info)
-            sql = "insert into confiscate values (null,%s, '%s',%s, now(), %s,'%s')" \
-                  % (str(money), str(old_date), str(round(sum, 1)), str(next_money), str(next_date_up))
-            # 检查连接是否断开，如果断开就进行重连
-            db.ping(reconnect=True)
-            try:
-                cursor.execute(sql)
-                db.commit()
-            except Exception as e:
-                info = "数据库储存有点异常~\n没有存进去！", e
-                exec_y_result.append({'failed': info})
-                print(info)
-            else:
-                info = "数据库存储成功！"
-                exec_y_result.append({'successful': info})
-                print(info)
-        else:
-            info = '好的，不执行'
-            exec_n_result.append(info)
-            print(info)
-
-    elif interval == 0:
-        info = "输入时间为当天~"
-        confiscate_info.append(info)
-    else:
-        info = "时间间隔出了问题，请确认！"
-        confiscate_info.append(info)
-
-    return logger
+    amounts = [x for x in best_fields if _NUM.fullmatch(x)]
+    last_amount = float(amounts[-1]) if amounts else None
+    return best_str, last_amount
 
 
-def deal_date():
-    sql1 = 'select next_date_up from confiscate order by id desc limit 1;'
-    sql2 = 'select next_money from confiscate order by id desc  limit 1;'
-    # 检查连接是否断开，如果断开就进行重连
-    db.ping(reconnect=True)
-    cursor.execute(sql1)
-    for data in cursor.fetchall():
-        next_date_up = data[0]
+def next_id():
+    """读取 sql 文件中的最大 id，返回下一个 id（文件缺失时返回 None）。"""
+    try:
+        with open(SQL_FILE, encoding="utf-8") as f:
+            ids = [int(m) for m in re.findall(r"\((\d+),", f.read())]
+    except FileNotFoundError:
+        return None
+    return max(ids) + 1 if ids else 1
 
-    cursor.execute(sql2)
-    for data in cursor.fetchall():
-        next_money = float(data[0])
 
-    print(next_date_up, next_money)
-    return [next_date_up, next_money]
+def make_insert(id_, start_date, start_amount, total, end_date, end_amount) -> str:
+    """拼出一条与历史结构一致的 INSERT 值列表。"""
+    id_text = "NULL" if id_ is None else str(id_)
+    return (f"({id_text}, '{start_amount}', '{start_date}', '{total}', "
+            f"'{end_date}', '{end_amount}', '{end_date}')")
 
-def del_last_record():
-    """
-    待测，不太能行
-    :return:
-    """
-    sql = 'delete from confiscate where id=(select id from confiscate order by id desc limit 1);'
-    cursor.execute(sql)
-    db.commit()
 
-def close_py():
-    cursor.close()
+def report(start_date, start_amount, end_date, plan, from_sql=False):
+    details, total, end_amount, resets = plan
+    src = "（取自 SQL 最近一条）" if from_sql else ""
+    print(f"上次：{start_date} 存 {start_amount} 元{src}")
+    print(f"本次：算到 {end_date}")
 
-if __name__ == '__main__':
-    # date, money = deal_date()
-    # 根据前面的查询执行
-    # result = new_confiscate(date, money, 'N')
-    result = new_confiscate("2026-07-16", 8.1)
-    print(result)
-    x = input("111")
+    if not details:
+        print("间隔 0 天，今日无需计算。")
+        return
+
+    interval = (end_date - start_date).days
+    print(f"间隔 {interval} 天，跨年重置 {resets} 次，合计需存 {total} 元")
+    print(f"末日（{end_date}）应存 {end_amount} 元，作为下次起点")
+
+    if interval <= 31:
+        print("明细：", "  ".join(f"{d.month:02d}-{d.day:02d}:{a}" for d, a in details))
+
+    values = make_insert(next_id(), start_date, start_amount, total, end_date, end_amount)
+    print("\n待写入 SQL：")
+    print(values + ",")
+
+
+def main() -> None:
+    MISSING = object()  # 哨兵：用于区分“用户未填”与“填了空值”
+    parser = argparse.ArgumentParser(description="存钱打卡计算器")
+    parser.add_argument("last_date", nargs="?", default=MISSING,
+                        help="上次打卡日期，如 2026-07-16（默认取 SQL 最近一条）")
+    parser.add_argument("last_amount", nargs="?", type=float, default=MISSING,
+                        help="上次打卡金额，如 8.1（默认取 SQL 最近一条）")
+    parser.add_argument("end_date", nargs="?", default=date.today().isoformat(),
+                        help="本次算到的日期，默认今天")
+    args = parser.parse_args()
+
+    from_sql = False
+    if args.last_date is MISSING or args.last_amount is MISSING:
+        sql_date, sql_amount = latest_record()
+        if args.last_date is MISSING:
+            args.last_date = sql_date
+        if args.last_amount is MISSING:
+            args.last_amount = sql_amount
+        from_sql = True
+
+    if args.last_date is None or args.last_amount is None:
+        print("未能从 SQL 读取默认的上次日期/金额，请手动指定：")
+        print("  python confiscate.py 2026-07-16 8.1 [结束日期]")
+        return
+
+    start_date = parse_date(args.last_date)
+    end_date = parse_date(args.end_date)
+    report(start_date, args.last_amount, end_date,
+           build_plan(start_date, args.last_amount, end_date), from_sql)
+
+
+if __name__ == "__main__":
+    main()
